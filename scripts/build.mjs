@@ -52,7 +52,8 @@ const metadata = `// ==UserScript==
 // @version      ${version}
 // @description  自动递归拆分并转存超过数量限制的百度网盘分享目录
 // @match        https://pan.baidu.com/*
-// @grant        none
+// @grant        GM.cookie
+// @grant        GM_cookie
 // @run-at       document-idle
 // ==/UserScript==`;
 const userscript = `${metadata}\n\n${await fs.readFile(path.join(src, "core.js"), "utf8")}\n\n${await fs.readFile(path.join(src, "userscript.js"), "utf8")}`;
