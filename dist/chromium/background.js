@@ -47,6 +47,57 @@
     return encodeURIComponent(path).replace(/%2F/gi, "/");
   }
 
+  // Baidu hands back percent-encoded paths in the share page payload.
+  function decodePath(path) {
+    const value = String(path || "");
+    try {
+      return decodeURIComponent(value);
+    } catch (_) {
+      return value;
+    }
+  }
+
+  // Baidu authorises /share/list via the BDCLND cookie (the "randsk" issued by
+  // /share/verify), not via the `sekey` query parameter. The cookie must be
+  // *replaced*, not merely appended: a stale BDCLND makes Baidu answer
+  // errno -9. This mirrors the approach proven by drunkdream/baidu-free-transfer.
+  const BDCLND_RE = /(?:^|;\s*)BDCLND=[^;]*/g;
+
+  function stripBdclnd(cookie) {
+    return String(cookie || "")
+      .replace(BDCLND_RE, "")
+      .replace(/^;+/, "")
+      .replace(/;{2,}/g, ";")
+      .replace(/;\s*$/, "")
+      .trim();
+  }
+
+  function appendBdclnd(cookie, randsk) {
+    if (!randsk) return cookie;
+    const base = stripBdclnd(cookie);
+    return `${base}${base && !base.endsWith(";") ? ";" : ""}BDCLND=${randsk}`;
+  }
+
+  // Pull a human-readable notice out of a Baidu HTML error page so callers
+  // can log something meaningful instead of raw markup or "Unexpected token".
+  function extractPageNotice(html) {
+    const source = String(html || "");
+    const patterns = [
+      /<title[^>]*>([^<]{2,120})<\/title>/i,
+      /"err_msg"\s*:\s*"([^"]{2,120})"/i,
+      /"show_msg"\s*:\s*"([^"]{2,120})"/i,
+      /<div[^>]*class="[^"]*(?:error|tip|notice)[^"]*"[^>]*>([^<]{2,120})</i
+    ];
+    for (const pattern of patterns) {
+      const match = source.match(pattern);
+      if (match) {
+        const text = match[1].replace(/\s+/g, " ").trim();
+        if (text && !/^(百度网盘|百度云)$/.test(text)) return text;
+      }
+    }
+    return "";
+  }
+
   function parseSharePage(html) {
     const marker = "locals.mset(";
     const start = html.indexOf(marker);
@@ -73,7 +124,11 @@
       userId: data.share_uk,
       shareId: data.shareid,
       bdstoken: data.bdstoken,
-      shareRoot: files[0].parent_path || "/",
+      // `parent_path` arrives percent-encoded (e.g.
+      // "%2Fsharelink1100208284303-297938749075651"). It is the prefix every
+      // in-share path must be built from, so decode it before use — leaving it
+      // encoded makes /share/list answer errno 2.
+      shareRoot: decodePath(files[0].parent_path || "/"),
       directories: files
         .filter((item) => Number(item.isdir) === 1)
         .map((item) => ({ id: item.fs_id, name: item.server_filename, isDirectory: true })),
@@ -90,13 +145,51 @@
       this.rootUrl = options.rootUrl || ROOT_URL;
       this.batchSize = options.batchSize || 100;
       this.maxRetries = options.maxRetries ?? 12;
+      this.maxDepth = options.maxDepth ?? 12;
       this.destination = normalizeDestination(options.destination || "");
       this.bdstoken = null;
       this.shareId = null;
       this.userId = null;
+      this.randsk = "";
+      // Cookie writer supplied by the host (GM_cookie / chrome.cookies). Baidu
+      // gates /share/list on the BDCLND cookie, which a page script cannot set
+      // on its own.
+      this.writeCookie = options.writeCookie || null;
       this.shareRoot = "/";
       this.directories = [];
       this.files = [];
+    }
+
+    // Persist `randsk` as the BDCLND cookie so subsequent /share/* calls are
+    // authorised. Returns false when the host provides no cookie writer, in
+    // which case callers fall back to the `sekey` query parameter.
+    async persistRandsk() {
+      if (!this.randsk || !this.writeCookie) return false;
+      try {
+        await this.writeCookie("BDCLND", this.randsk, "/", ".baidu.com");
+        return true;
+      } catch (_) {
+        try {
+          await this.writeCookie("BDCLND", this.randsk, "/", "pan.baidu.com");
+          return true;
+        } catch (_) {
+          return false;
+        }
+      }
+    }
+
+    // Password-protected shares issue a `randsk` from /share/verify. Baidu
+    // echoes it back as the `BDCLND` cookie and accepts it as `sekey` on later
+    // /share/* calls. It is already percent-encoded by Baidu, so it must be
+    // passed through verbatim — double-encoding it breaks authorisation.
+    //
+    // Field note (verified against pan.baidu.com): /share/list rejects a
+    // request with `{"errno":9019,"errmsg":"need verify"}` unless either the
+    // `BDCLND` cookie or a valid `sekey` is present, so both are sent.
+    shareAuthParams() {
+      if (!this.randsk) return "";
+      const raw = String(this.randsk).replace(/^"|"$/g, "");
+      return `&sekey=${raw}`;
     }
 
     progress(message) {
@@ -112,6 +205,12 @@
           "X-Requested-With": "XMLHttpRequest",
           "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
         },
+        // Baidu rejects share endpoints reached without a pan.baidu.com
+        // referrer. Browsers forbid scripts from setting `Referer` directly,
+        // so declare it through the fetch `referrer` option instead (a no-op
+        // in the extension service worker, where the DNR rule covers it).
+        referrer: `${this.rootUrl}/`,
+        referrerPolicy: "strict-origin-when-cross-origin",
         body: options.body || undefined,
         credentials: "include"
       });
@@ -125,13 +224,44 @@
       if (!response.ok) {
         throw new BaiduPanError(`网络请求失败：HTTP ${response.status}`, { response: data });
       }
+      // Baidu answers HTML landing pages (e.g. "啊哦，链接出错了") instead of
+      // JSON when a share API call is unauthorised. Surface that page text
+      // rather than leaking raw markup into the progress log.
+      if (typeof data === "string" && options.checkErrno) {
+        const notice = extractPageNotice(data);
+        throw new BaiduPanError(notice || "百度网盘返回了非预期内容，请确认分享链接与提取码", {
+          response: data
+        });
+      }
       if (options.checkErrno && data && typeof data === "object" && Number(data.errno || 0) !== 0) {
-        throw new BaiduPanError(data.show_msg || data.errmsg || `百度网盘错误 ${data.errno}`, {
+        throw new BaiduPanError(this.describeErrno(data), {
           errno: Number(data.errno),
           response: data
         });
       }
       return data;
+    }
+
+    // Translate Baidu's terse errno into an actionable message.
+    describeErrno(data) {
+      const errno = Number(data.errno || 0);
+      const fallback = data.show_msg || data.errmsg || `百度网盘错误 ${errno}`;
+      const known = {
+        9019: "分享需要重新验证提取码，请填写提取码后重试",
+        "-9": "提取码错误，请核对后重试",
+        "-12": "分享的文件数超过转存上限",
+        12: "批量操作失败，文件数可能超过限制",
+        105: "分享链接地址错误或已失效",
+        2: "参数错误，请刷新百度网盘页面后重试",
+        "-6": "百度网盘登录已过期，请重新登录后刷新页面",
+        111: "请求过于频繁，已被百度网盘限流，请稍后重试",
+        1504: "操作过于频繁，请稍后重试"
+      };
+      // Baidu sometimes answers with a throttling notice under an otherwise
+      // unrecognised code; surface it with a retry hint instead of raw text.
+      const isThrottle = /请求超时|请求过快|繁忙|频繁|稍后再试/.test(fallback);
+      if (isThrottle) return `${fallback}（百度网盘限流，请等待几分钟后重试）`;
+      return known[String(errno)] || fallback;
     }
 
     async getBdstoken() {
@@ -154,12 +284,20 @@
         checkErrno: true
       });
       if (!data.randsk) throw new BaiduPanError("提取码验证失败");
+      this.randsk = data.randsk;
+      // Writing the BDCLND cookie is what actually unlocks /share/list; the
+      // `sekey` parameter alone is not honoured for listing.
+      await this.persistRandsk();
       return data.randsk;
     }
 
     async loadShare(input, password = "") {
       const shareKey = extractShareKey(input);
       if (!shareKey) throw new BaiduPanError("无法从输入内容中识别百度网盘分享链接");
+      // Verify the extraction code first. Baidu hands back `randsk` here and
+      // mirrors it into the BDCLND cookie; fetching the share page before that
+      // can return an empty file_list, and the later /share/list call then
+      // fails with errno 9019 ("need verify").
       if (password) await this.verifyShare(shareKey, password);
       const html = await this.request(`/s/1${shareKey}`);
       const data = parseSharePage(html);
@@ -201,7 +339,7 @@
           `from=${encodeURIComponent(this.userId)}`,
           "ondup=newcopy", "channel=chunlei",
           `bdstoken=${encodeURIComponent(this.bdstoken)}`
-        ].join("&"),
+        ].join("&") + this.shareAuthParams(),
         body: `fsidlist=${encodeURIComponent(JSON.stringify(ids))}&path=${encodeURIComponent(destination || "/")}`
       });
       const errno = Number(data?.errno || 0);
@@ -215,8 +353,17 @@
       if (errno === 12) {
         const limit = data.target_file_nums_limit;
         const count = data.target_file_nums;
+        // errno 12 is overloaded: it also fires for reasons unrelated to a
+        // file-count ceiling (e.g. an empty or single-folder share). Only
+        // claim "over the limit" when Baidu actually reports the numbers.
+        if (limit || count) {
+          throw new BaiduPanError(
+            `目录超过单次转存限制（${count ?? "?"}/${limit ?? "?"} 个文件）`,
+            { errno, response: data }
+          );
+        }
         throw new BaiduPanError(
-          `目录超过单次转存限制${limit && count ? `（${count}/${limit}）` : ""}`,
+          data?.show_msg || data?.errmsg || "百度网盘拒绝了本次转存（该目录可能为空或不允许转存）",
           { errno, response: data }
         );
       }
@@ -239,12 +386,18 @@
       const result = [];
       for (let page = 1; ; page += 1) {
         const data = await this.request("/share/list", {
+          // Field note (verified against pan.baidu.com): do NOT send `root=1`.
+          // With `root=1` Baidu resolves `dir` from the *account* root and
+          // answers with the requested folder itself (e.g. asking for
+          // `.../9.16` returns `9.16`), which makes the recursive splitter loop
+          // until it times out. Omitting it — or sending `root=0` — makes
+          // `dir` resolve inside the share and returns the real children.
           query: [
             `uk=${encodeURIComponent(this.userId)}`,
             `shareid=${encodeURIComponent(this.shareId)}`,
             "order=name", "desc=0", "showempty=0",
             `page=${page}`, "num=100", `dir=${encodePath(path)}`
-          ].join("&"),
+          ].join("&") + this.shareAuthParams(),
           checkErrno: true
         });
         const list = Array.isArray(data.list) ? data.list : [];
@@ -259,7 +412,7 @@
       }
     }
 
-    async transferDirectories(directories, destination) {
+    async transferDirectories(directories, destination, relativePath = "", depth = 0) {
       if (!directories.length) return;
       await this.createDirectory(destination);
       try {
@@ -267,26 +420,59 @@
         for (const item of directories) {
           this.progress(`已转存目录 ${destination || ""}/${item.name}`);
         }
+        return;
       } catch (error) {
         if (error.errno !== 12) throw error;
-        this.progress(`目录数量超过限制，正在拆分处理：${directories.map((item) => item.name).join("、")}`);
-        if (directories.length > 1) {
-          const middle = Math.floor(directories.length / 2);
-          await this.transferDirectories(directories.slice(0, middle), destination);
-          await this.transferDirectories(directories.slice(middle), destination);
-          return;
-        }
-        const directory = directories[0];
-        const relative = destination.slice(this.destination.length);
-        const sourcePath = `${this.shareRoot}${relative}/${directory.name}`.replace(/\/+/g, "/");
-        const children = await this.listShareDirectory(sourcePath);
-        const childDestination = `${destination}/${directory.name}`.replace(/\/+/g, "/");
-        const childDirectories = children.filter((item) => item.isDirectory);
-        const childFiles = children.filter((item) => !item.isDirectory);
-        await this.createDirectory(childDestination);
-        if (childDirectories.length) await this.transferDirectories(childDirectories, childDestination);
-        if (childFiles.length) await this.transferFiles(childFiles, childDestination);
       }
+
+      this.progress(`目录数量超过限制，正在拆分处理：${directories.map((item) => item.name).join("、")}`);
+
+      // A directory tree can exceed the per-transfer limit at any level. Split
+      // a sibling set by halving it, but never recurse without bound: a share
+      // whose root is itself a single folder keeps answering /share/list with
+      // that same folder, which would otherwise loop forever.
+      if (directories.length > 1) {
+        const middle = Math.floor(directories.length / 2);
+        await this.transferDirectories(directories.slice(0, middle), destination, relativePath, depth);
+        await this.transferDirectories(directories.slice(middle), destination, relativePath, depth);
+        return;
+      }
+
+      const directory = directories[0];
+      if (depth >= this.maxDepth) {
+        throw new BaiduPanError(
+          `目录「${directory.name}」层级过深（已递归 ${depth} 层），无法继续拆分。` +
+          `该分享可能不允许展开子目录，建议改为保存到网盘后手动整理。`,
+          { errno: 12 }
+        );
+      }
+
+      const sourcePath = `${relativePath}/${directory.name}`.replace(/\/{2,}/g, "/");
+      const children = await this.listShareDirectory(`${this.shareRoot}${sourcePath}`.replace(/\/{2,}/g, "/"));
+
+      // Guard against a share whose listing ignores `dir` and keeps returning
+      // the very folder we asked about. Without this the same folder is
+      // re-transferred indefinitely.
+      const selfReferential = children.length > 0 && children.every(
+        (item) => item.isDirectory && (item.id === directory.id || item.name === directory.name)
+      );
+      if (selfReferential) {
+        throw new BaiduPanError(
+          `无法拆分「${directory.name}」：百度网盘未提供该目录的内部列表，` +
+          `说明这个分享本身就不允许展开子目录（常见于只分享单个文件夹、且该文件夹为空的情况）。` +
+          `这种情况无法通过拆分解决——请直接用百度网盘网页端「保存到网盘」完成转存。`,
+          { errno: 12 }
+        );
+      }
+
+      const childDestination = `${destination}/${directory.name}`.replace(/\/{2,}/g, "/");
+      const childDirectories = children.filter((item) => item.isDirectory);
+      const childFiles = children.filter((item) => !item.isDirectory);
+      await this.createDirectory(childDestination);
+      if (childDirectories.length) {
+        await this.transferDirectories(childDirectories, childDestination, sourcePath, depth + 1);
+      }
+      if (childFiles.length) await this.transferFiles(childFiles, childDestination);
     }
 
     async run(input, password = "") {
@@ -306,7 +492,11 @@
     extractShareKey,
     normalizeDestination,
     parseSharePage,
-    encodePath
+    encodePath,
+    decodePath,
+    extractPageNotice,
+    stripBdclnd,
+    appendBdclnd
   };
 });
 

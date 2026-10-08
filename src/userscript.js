@@ -5,6 +5,46 @@
   const STORAGE_KEY = "bpth-form-v1";
   let running = false;
 
+  // Baidu authorises share listing through the BDCLND cookie, which a page
+  // script cannot set directly. Tampermonkey / Violentmonkey expose GM_cookie
+  // for exactly this; when it is unavailable the transfer falls back to the
+  // `sekey` query parameter (which works for some shares but not all).
+  const gmCookie = (() => {
+    const api = (typeof GM_cookie !== "undefined" && GM_cookie)
+      || (typeof GM !== "undefined" && GM && GM.cookie)
+      || null;
+    return api && typeof api.set === "function" ? api : null;
+  })();
+
+  function writeCookie(name, value, path, domain) {
+    if (!gmCookie) {
+      return Promise.reject(new Error("GM_cookie 不可用"));
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const done = (error) => {
+        if (settled) return;
+        settled = true;
+        error ? reject(error) : resolve();
+      };
+      try {
+        // Tampermonkey's GM_cookie.set is callback-based; Violentmonkey's
+        // GM.cookie.set returns a promise. Support both.
+        if (gmCookie.set.length >= 2) {
+          gmCookie.set({ name, value, path, domain }, (error) => done(error || undefined));
+        } else {
+          const result = gmCookie.set({ name, value, path, domain });
+          if (result && typeof result.then === "function") result.then(() => done(), done);
+          else done();
+        }
+        // Never let a non-reporting host hang the whole transfer.
+        setTimeout(() => done(), 500);
+      } catch (error) {
+        done(error);
+      }
+    });
+  }
+
   const style = document.createElement("style");
   style.textContent = `
     #bpth-launcher{position:fixed;right:22px;bottom:92px;z-index:2147483646;width:52px;height:52px;border:0;border-radius:50%;background:linear-gradient(135deg,#2878ff,#74a9ff);color:#fff;font:700 15px/1 sans-serif;box-shadow:0 10px 28px #1c5fdc66;cursor:pointer}
@@ -67,7 +107,11 @@
     startButton.textContent = "正在转存…";
     status.textContent = "";
     try {
-      const transfer = new BaiduPanTransfer({ destination: destinationInput.value, onProgress: log });
+      const transfer = new BaiduPanTransfer({
+        destination: destinationInput.value,
+        onProgress: log,
+        writeCookie
+      });
       await transfer.run(urlInput.value, passwordInput.value);
       log("✅ 转存成功，请刷新百度网盘文件列表");
       urlInput.value = "";

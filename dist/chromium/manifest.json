@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "百度网盘批量转存助手（跨浏览器版）",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "自动递归拆分并转存超过数量限制的百度网盘分享目录，支持自定义保存目录。",
   "action": {
     "default_popup": "popup.html",
